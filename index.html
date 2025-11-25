@@ -4885,6 +4885,7 @@ async function debugHistory() {
           await FirebaseService.saveTank(device);
         });
       } else {
+        // VALVE SIDEBAR
         const info = device.info();
         const affectedPipelines = findAffectedPipelines(device);
         const { stats } = calculateHouseholdStats();
@@ -4894,7 +4895,22 @@ async function debugHistory() {
         const parentValve = isSubValve ? valves.find(v => v.id === device.parentValveId) : null;
         const supplyInfo = supplies.find(s => s.valveId === device.id);
         
+        // Get analytics and device telemetry
+        const analyticsValve = analyticsState?.valves?.[device.id] || null;
+        const valveDeviceTelemetry = analyticsValve?.device || resolveDeviceTelemetry(device);
+        
+        // Build live metrics object with real or fallback data
+        const valveLiveMetrics = {
+          battery: valveDeviceTelemetry?.battery !== undefined ? `${valveDeviceTelemetry.battery}%` : (info.battery || '—'),
+          pressure: valveDeviceTelemetry?.pressure !== undefined ? `${valveDeviceTelemetry.pressure} PSI` : (info.pressure || '—')
+        };
+        
+        const valveTelemetryDistance = valveDeviceTelemetry?.distance_meters ?? valveDeviceTelemetry?.distanceMeters ?? null;
+        const valveDeviceTimestamp = valveDeviceTelemetry?.timestamp ? new Date(valveDeviceTelemetry.timestamp).toLocaleString() : '—';
+        
         setText('sidebarTitle', `⚙️ ${device.name}`);
+        
+        // Build hierarchy HTML
         let hierarchyHTML = '';
         if(mainValveData) {
           hierarchyHTML = `
@@ -4956,6 +4972,7 @@ async function debugHistory() {
           `;
         }
         
+        // Build household stats HTML
         let householdStatsHTML = '';
         const { valveTree } = calculateHouseholdStats();
         const deviceNode = valveTree.get(device.id);
@@ -5019,6 +5036,7 @@ async function debugHistory() {
           `;
         }
         
+        // Build complete valve sidebar
         body.innerHTML = `
           <div class="card">
             <h4><i class="fas fa-info-circle"></i> DETAILS</h4>
@@ -5040,7 +5058,7 @@ async function debugHistory() {
             <h4><i class="fas fa-satellite-dish"></i> FIELD DEVICE</h4>
             <div class="row"><span class="label">Device ID</span><span class="value">${valveDeviceTelemetry.id || device.id}</span></div>
             <div class="row"><span class="label">Last Update</span><span class="value">${valveDeviceTimestamp}</span></div>
-            <div class="row"><span class="label">Distance</span><span class="value">${valveTelemetryDistance !== null ? valveTelemetryDistance.toFixed(2) + ' m' : '—'}</span></div>
+            ${valveTelemetryDistance !== null ? `<div class="row"><span class="label">Distance</span><span class="value">${valveTelemetryDistance.toFixed(2)} m</span></div>` : ''}
           </div>
           ` : ''}
           <div class="card">
@@ -5079,8 +5097,6 @@ async function debugHistory() {
             <button class="btn" onclick="editValve('${device.id}')"><i class="fas fa-pen"></i> Edit Valve</button>
             <button class="btn danger" onclick="deleteValve('${device.id}')"><i class="fas fa-trash"></i> Delete</button>
           </div>
-
-
           <div class="card">
             <h4><i class="fas fa-clock-rotate-left"></i> HISTORICAL DATA</h4>
             <button class="btn primary" onclick="openHistory('${device.id}', 'valves')">
