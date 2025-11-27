@@ -4539,48 +4539,282 @@ async function debugHistory() {
       HistoryService.exportToCSV(currentHistoryData, device.name, currentHistoryType);
     }
 
-    // ==================== SIDEBAR ====================
-    async function showDevice(device, type) {
+    // ==================== HELPER FUNCTIONS ====================
 
-      document.getElementById('supplyDashboard').classList.add('shifted');
+// Convert ESP32 millis timestamp to real datetime
+function convertDeviceTimestamp(deviceMillis) {
+  if (!deviceMillis) return null;
+  
+  // Device sends millis since boot, we need to calculate actual time
+  // Assume we store the server time when device first connected
+  const now = Date.now();
+  const estimatedBootTime = now - deviceMillis;
+  return new Date(estimatedBootTime + deviceMillis);
+}
 
-      const sidebar = document.getElementById('sidebar');
-      const body = document.getElementById('sidebarBody');
-      currentSidebarDeviceId = device?.id || null;
-      currentSidebarDeviceType = type || null;
+// Get real timestamp from device data
+function getRealTimestamp(deviceTelemetry) {
+  if (!deviceTelemetry) return null;
+  
+  const deviceMillis = deviceTelemetry.timestamp;
+  if (!deviceMillis) return null;
+  
+  // Calculate real time: current time - (device uptime)
+  const now = Date.now();
+  const deviceUptime = deviceMillis;
+  const estimatedRealTime = now - (Date.now() - deviceUptime);
+  
+  return new Date(estimatedRealTime);
+}
+
+// Calculate ETA for tank depletion with proper datetime
+function calculateTankETAWithTime(tank, currentFlow) {
+  const currentVolume = tank.calculateCurrentVolume();
+  const maxCapacity = tank.calculateMaxCapacity();
+  const fillPercent = (currentVolume / maxCapacity) * 100;
+  
+  let status = 'good';
+  let statusColor = '#4caf50';
+  let timeToEmpty = 0;
+  let etaDate = null;
+  let etaFormatted = '—';
+  
+  if (currentFlow > 0) {
+    timeToEmpty = currentVolume / currentFlow; // minutes
+    const now = new Date();
+    etaDate = new Date(now.getTime() + timeToEmpty * 60000);
+    
+    // Format ETA
+    const today = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    if (etaDate.toDateString() === today.toDateString()) {
+      etaFormatted = `Today at ${etaDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
+    } else if (etaDate.toDateString() === tomorrow.toDateString()) {
+      etaFormatted = `Tomorrow at ${etaDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
+    } else {
+      etaFormatted = etaDate.toLocaleString('en-US', { 
+        month: 'short', 
+        day: 'numeric', 
+        hour: '2-digit', 
+        minute: '2-digit' 
+      });
+    }
+    
+    // Status logic
+    if (timeToEmpty < 60) { // Less than 1 hour
+      status = 'critical';
+      statusColor = '#f44336';
+    } else if (timeToEmpty < 240) { // Less than 4 hours
+      status = 'warning';
+      statusColor = '#ff9800';
+    }
+  } else {
+    status = 'no_flow';
+    statusColor = '#2196f3';
+  }
+  
+  return {
+    status,
+    statusColor,
+    currentVolume,
+    maxCapacity,
+    fillPercent,
+    currentFlow,
+    timeToEmpty,
+    etaDate,
+    etaFormatted,
+    timeFormatted: formatTime(timeToEmpty)
+  };
+}
+
+// Format time in human readable format
+function formatTime(minutes) {
+  if (minutes === 0) return '—';
+  
+  const hours = Math.floor(minutes / 60);
+  const mins = Math.floor(minutes % 60);
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  
+  if (days > 0) {
+    return `${days}d ${remainingHours}h ${mins}m`;
+  } else if (hours > 0) {
+    return `${hours}h ${mins}m`;
+  } else {
+    return `${mins}m`;
+  }
+}
+
+// Recursive function to get all sub-valves (multi-level)
+function getAllSubValvesRecursive(mainValveId, allValves) {
+  const directSubs = allValves.filter(v => v.parentValveId === mainValveId);
+  let allSubs = [...directSubs];
+  
+  // Recursively get sub-valves of sub-valves
+  directSubs.forEach(subValve => {
+    const nestedSubs = getAllSubValvesRecursive(subValve.id, allValves);
+    allSubs = [...allSubs, ...nestedSubs];
+  });
+  
+  return allSubs;
+}
+
+// Calculate total households including all nested sub-valves
+function calculateTotalHouseholds(valve, allValves) {
+  let total = valve.households || 0;
+  
+  const allSubValves = getAllSubValvesRecursive(valve.id, allValves);
+  allSubValves.forEach(sv => {
+    total += sv.households || 0;
+  });
+  
+  return total;
+}
+
+// Calculate currently served households (only open valves)
+function calculateServedHouseholds(valve, allValves) {
+  let served = 0;
+  
+  // If main valve is closed, nobody gets water
+  if (valve.active) return 0;
+  
+  // Add direct households if valve is open
+  served += valve.households || 0;
+  
+  // Recursively check sub-valves
+  const directSubs = allValves.filter(v => v.parentValveId === valve.id);
+  directSubs.forEach(subValve => {
+    if (!subValve.active) {
+      served += calculateServedHouseholds(subValve, allValves);
+    }
+  });
+  
+  return served;
+}
+
+// Search valves by ID or name
+function searchValves(query, allValves) {
+  if (!query) return [];
+  
+  const lowerQuery = query.toLowerCase();
+  return allValves.filter(v => 
+    v.id.toLowerCase().includes(lowerQuery) || 
+    v.name.toLowerCase().includes(lowerQuery)
+  );
+}
+
+// ==================== MAIN SHOWDEVICE FUNCTION ====================
+
+async function showDevice(device, type) {
+  document.getElementById('supplyDashboard').classList.add('shifted');
+
+  const sidebar = document.getElementById('sidebar');
+  const body = document.getElementById('sidebarBody');
+  currentSidebarDeviceId = device?.id || null;
+  currentSidebarDeviceType = type || null;
+  
+  if(type === 'tank') {
+    const info = device.info();
+    const connectedPipelines = findConnectedPipelines(device);
+    const analyticsTank = analyticsState?.tanks?.[device.id] || null;
+    const deviceTelemetry = analyticsTank?.device || resolveDeviceTelemetry(device);
+    const householdsData = analyticsTank?.households || null;
+    
+    // Get real distance from device (ESP32 sends "distance" field)
+    const telemetryDistance = deviceTelemetry?.distance ?? deviceTelemetry?.distance_meters ?? deviceTelemetry?.distanceMeters ?? null;
+    
+    // Calculate water level from distance if available
+    let displayWaterLevel = device.waterLevel;
+    if (telemetryDistance !== null && telemetryDistance !== undefined && device.deviceId) {
+      displayWaterLevel = device.calculateWaterLevelFromDistance(telemetryDistance);
+      // Update tank water level if it changed significantly
+      if (Math.abs(device.waterLevel - displayWaterLevel) > 0.01) {
+        device.setWaterLevel(displayWaterLevel);
+      }
+    }
+    
+    // Fix timestamp - convert from millis to real datetime
+    let deviceTimestamp = '—';
+    let deviceTimestampRaw = null;
+    if (deviceTelemetry?.timestamp) {
+      // ESP32 sends millis since boot, calculate real time
+      const now = Date.now();
+      const deviceMillis = deviceTelemetry.timestamp;
       
-      if(type === 'tank') {
-        const info = device.info();
-        const connectedPipelines = findConnectedPipelines(device);
-        const analyticsTank = analyticsState?.tanks?.[device.id] || null;
-        const etaData = analyticsTank?.eta || calculateTankETA(device);
-        const deviceTelemetry = analyticsTank?.device || resolveDeviceTelemetry(device);
-        const householdsData = analyticsTank?.households || null;
-        
-        // Get real distance from device (ESP32 sends "distance" field)
-        const telemetryDistance = deviceTelemetry?.distance ?? deviceTelemetry?.distance_meters ?? deviceTelemetry?.distanceMeters ?? null;
-        
-        // Calculate water level from distance if available
-        let displayWaterLevel = device.waterLevel;
-        if (telemetryDistance !== null && telemetryDistance !== undefined && device.deviceId) {
-          displayWaterLevel = device.calculateWaterLevelFromDistance(telemetryDistance);
-          // Update tank water level if it changed significantly
-          if (Math.abs(device.waterLevel - displayWaterLevel) > 0.01) {
-            device.setWaterLevel(displayWaterLevel);
-          }
+      // Estimate device boot time (assuming data is recent)
+      // In production, you should store boot time in Firebase
+      const estimatedBootTime = now - deviceMillis;
+      const realTime = new Date(estimatedBootTime + deviceMillis);
+      
+      deviceTimestampRaw = realTime;
+      deviceTimestamp = realTime.toLocaleString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      });
+      
+      // Calculate time ago
+      const secondsAgo = Math.floor((now - realTime.getTime()) / 1000);
+      if (secondsAgo < 60) {
+        deviceTimestamp += ` (${secondsAgo}s ago)`;
+      } else if (secondsAgo < 3600) {
+        deviceTimestamp += ` (${Math.floor(secondsAgo / 60)}m ago)`;
+      } else {
+        deviceTimestamp += ` (${Math.floor(secondsAgo / 3600)}h ago)`;
+      }
+    }
+    
+    // Calculate current outflow from connected main valves
+    let totalOutflow = 0;
+    if (device.connectedMainValves && device.connectedMainValves.length > 0) {
+      const connectedValves = valves.filter(v => 
+        device.connectedMainValves.includes(v.id) && v.category === 'main'
+      );
+      
+      connectedValves.forEach(valve => {
+        if (!valve.active) {
+          totalOutflow += valve.flowRate || 0;
+          
+          // Add sub-valve flows recursively
+          const allSubs = getAllSubValvesRecursive(valve.id, valves);
+          allSubs.forEach(sv => {
+            if (!sv.active) totalOutflow += (sv.flowRate || 0);
+          });
         }
-        
-        const deviceTimestamp = deviceTelemetry?.timestamp ? new Date(deviceTelemetry.timestamp).toLocaleString() : '—';
-        
-        // Only show real data, no dummy values
-        const liveMetrics = {
-          distance: telemetryDistance !== null ? `${(telemetryDistance * 100).toFixed(1)} cm` : '—',
-          waterLevel: `${displayWaterLevel.toFixed(2)} m`,
-          timestamp: deviceTimestamp
-        };
-        setText('sidebarTitle', `🏗️ ${device.name}`);
-        body.innerHTML = `
-          <div class="card">
+      });
+    }
+    
+    // Calculate ETA with proper datetime
+    const etaData = calculateTankETAWithTime(device, totalOutflow);
+    
+    // Calculate total households served
+    let totalHouseholdsServed = 0;
+    if (device.connectedMainValves && device.connectedMainValves.length > 0) {
+      const connectedValves = valves.filter(v => 
+        device.connectedMainValves.includes(v.id) && v.category === 'main'
+      );
+      
+      connectedValves.forEach(valve => {
+        totalHouseholdsServed += calculateServedHouseholds(valve, valves);
+      });
+    }
+    
+    // Live metrics display
+    const liveMetrics = {
+      distance: telemetryDistance !== null ? `${(telemetryDistance * 100).toFixed(1)} cm` : '—',
+      waterLevel: `${displayWaterLevel.toFixed(2)} m`,
+      timestamp: deviceTimestamp
+    };
+    
+    setText('sidebarTitle', `🏗️ ${device.name}`);
+    body.innerHTML = `
+      <div class="card">
             <h4><i class="fas fa-info-circle"></i> DETAILS</h4>
             <div class="row"><span class="label">ID</span><span class="value">${info.id}</span></div>
             <div class="row"><span class="label">Type</span><span class="value">${info.type}</span></div>
